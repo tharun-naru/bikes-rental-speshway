@@ -1,0 +1,341 @@
+import { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
+import { Navbar } from '@/components/Navbar';
+import { Footer } from '@/components/Footer';
+import { SEO } from '@/components/SEO';
+import { getCurrentUser, paymentsAPI, documentsAPI, rentalsAPI } from '@/lib/api';
+import { toast } from '@/hooks/use-toast';
+import { Bike } from '@/types';
+import { calculateRentalPrice } from '@/utils/priceCalculator';
+import { calculateSimplePrice } from '@/utils/simplePriceCalculator';
+
+interface BookingDetails {
+  bike: Bike;
+  pickupTime: string;
+  dropoffTime: string;
+  durationHours: number;
+  totalAmount: number;
+  pricingType?: 'hourly' | 'daily' | 'weekly';
+}
+
+export default function Payment() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [loading, setLoading] = useState(false);
+
+  const bookingDetails = location.state?.bookingDetails as BookingDetails;
+
+  useEffect(() => {
+    checkActiveRental();
+  }, []);
+
+  const checkActiveRental = async () => {
+    try {
+      const rentals = await rentalsAPI.getAll();
+      const currentUser = getCurrentUser();
+      const active = rentals.find((r: any) => {
+        const rentalUserId = r.userId || r.user?.id;
+        return (
+          String(rentalUserId || '') === String(currentUser?.id || '') &&
+          ['confirmed', 'ongoing', 'active'].includes(r.status)
+        );
+      });
+
+      if (active) {
+        toast({
+          title: 'Active Rental Found',
+          description:
+            'You already have an active rental. Please complete it before booking another.',
+          variant: 'destructive',
+        });
+        navigate('/'); // Redirect to home
+      }
+    } catch (error) {
+      console.error('Failed to check active rental', error);
+    }
+  };
+
+  useEffect(() => {
+    if (!bookingDetails) {
+      navigate('/ride-finder');
+      return;
+    }
+    const user = getCurrentUser();
+    if (!user) {
+      toast({
+        title: 'Login Required',
+        description: 'Please login to continue payment.',
+        variant: 'destructive',
+      });
+      navigate('/auth');
+      return;
+    }
+
+    // Check if all documents are verified
+    const checkDocuments = async () => {
+      try {
+        const userDocs = await documentsAPI.getAll();
+        const requiredTypes = ['aadhar_front', 'aadhar_back', 'pan', 'driving_license'];
+        const approvedTypes = (userDocs || [])
+          .filter((doc: any) => doc.status === 'approved')
+          .map((doc: any) => doc.type);
+
+        const allVerified = requiredTypes.every((type) => approvedTypes.includes(type));
+
+        if (!allVerified) {
+          toast({
+            title: 'Verification Required',
+            description: 'All documents must be uploaded and verified before booking a ride.',
+            variant: 'destructive',
+          });
+          navigate('/dashboard?tab=documents');
+          return;
+        }
+      } catch (error: any) {
+        toast({
+          title: 'Error',
+          description: 'Failed to verify documents. Please try again.',
+          variant: 'destructive',
+        });
+        navigate('/ride-finder');
+      }
+    };
+
+    checkDocuments();
+  }, [bookingDetails, navigate]);
+
+  if (!bookingDetails) return null;
+
+  const {
+    bike,
+    pickupTime,
+    dropoffTime,
+    durationHours,
+    totalAmount,
+    pricingType = 'hourly',
+  } = bookingDetails;
+
+  // Calculate price breakdown - use the same logic as Garage.tsx to ensure consistency
+  const startDate = new Date(pickupTime);
+  const endDate = new Date(dropoffTime);
+  let priceInfo: any = null;
+  try {
+    // Use the same calculation logic as Garage.tsx to ensure consistency
+    const hasIndividualRates = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24].some(
+      (hour) =>
+        bike[`pricePerHour${hour}` as keyof typeof bike] &&
+        Number(bike[`pricePerHour${hour}` as keyof typeof bike]) > 0
+    );
+    const hasTariff = bike.weekdayRate !== undefined || bike.weekendRate !== undefined;
+
+    if (bike.price12Hours || hasIndividualRates || bike.pricePerWeek || hasTariff) {
+      priceInfo = calculateSimplePrice(bike, startDate, endDate);
+    } else {
+      // Fallback to legacy pricing slabs
+      priceInfo = calculateRentalPrice(bike, startDate, endDate, pricingType || 'hourly');
+    }
+
+    // Ensure priceInfo is valid
+    if (!priceInfo || !priceInfo.total) {
+      throw new Error('Price calculation returned invalid result');
+    }
+  } catch (error: any) {
+    console.error('Price calculation error:', error);
+    toast({
+      title: 'Pricing Error',
+      description: error.message || 'Unable to calculate price. Please try again.',
+      variant: 'destructive',
+    });
+    // Redirect back if price cannot be calculated
+    setTimeout(() => navigate('/ride-finder'), 3000);
+    return null;
+  }
+
+  const handlePayment = async () => {
+    try {
+      setLoading(true);
+      const finalAmount = priceInfo ? Math.round(priceInfo.total) : totalAmount;
+      const { keyId } = await paymentsAPI.getKey();
+      const order = await paymentsAPI.createOrder(finalAmount);
+      const options = {
+        key: keyId,
+        amount: order.amount,
+        currency: order.currency,
+        name: 'RideFlow',
+        description: `Rental for ${bike.name}`,
+        order_id: order.id,
+        handler: async function (response: any) {
+          try {
+            const selectedLocationId = localStorage.getItem('selectedLocation') || undefined;
+            const finalAmount = priceInfo ? Math.round(priceInfo.total) : totalAmount;
+            const result = await paymentsAPI.verifyPayment({
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_signature: response.razorpay_signature,
+              bookingDetails: {
+                bikeId: bike.id,
+                pickupTime,
+                dropoffTime,
+                totalAmount: finalAmount,
+                pricingType,
+                selectedLocationId,
+                additionalImages: [],
+              },
+            });
+
+            if (result.success) {
+              navigate('/payment-success', { state: { rental: result.rental, bike } });
+            } else {
+              toast({
+                title: 'Payment Verification Failed',
+                description: result.message || 'Please contact support if money was deducted.',
+                variant: 'destructive',
+              });
+            }
+          } catch (error: any) {
+            toast({
+              title: 'Payment Verification Failed',
+              description: error.message || 'Please contact support if money was deducted.',
+              variant: 'destructive',
+            });
+          }
+        },
+        prefill: {
+          name: 'RideFlow User',
+          email: 'user@example.com',
+          contact: '9999999999',
+        },
+        theme: {
+          color: '#F97316',
+        },
+        modal: {
+          ondismiss: function () {
+            setLoading(false);
+          },
+        },
+        config: {
+          display: {
+            blocks: {
+              upi: {
+                name: 'Pay using UPI',
+                instruments: [
+                  {
+                    method: 'upi',
+                    vpa: true,
+                    qr: true,
+                  },
+                ],
+              },
+            },
+            sequence: ['block.upi'],
+            preferences: {
+              show_default_blocks: true,
+            },
+          },
+        },
+      };
+
+      const rzp1 = new (window as any).Razorpay(options);
+      rzp1.open();
+    } catch (error: any) {
+      toast({
+        title: 'Error',
+        description: error.message || 'Failed to initiate payment',
+        variant: 'destructive',
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <SEO
+        title="Complete Your Booking"
+        description="Securely complete your bike rental booking on RideFlow. Proceed to payment."
+        noindex={true}
+      />
+      <Navbar />
+      <div className="flex-grow container mx-auto px-4 py-8">
+        <div className="max-w-md mx-auto">
+          <h1 className="text-2xl font-bold mb-6">Payment Summary</h1>
+          <Card>
+            <CardHeader>
+              <CardTitle>{bike.name}</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Pickup</span>
+                <span className="font-medium">{new Date(pickupTime).toLocaleString()}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Dropoff</span>
+                <span className="font-medium">{new Date(dropoffTime).toLocaleString()}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Duration</span>
+                <span className="font-medium">{Math.round(durationHours)} hours</span>
+              </div>
+              {priceInfo && (
+                <>
+                  <hr />
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Base Price</span>
+                      <span className="font-medium">₹{priceInfo.basePrice.toFixed(2)}</span>
+                    </div>
+                    {priceInfo.hasWeekend && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">
+                          Weekend Surge ({((priceInfo.surgeMultiplier - 1) * 100).toFixed(0)}%)
+                        </span>
+                        <span className="font-medium text-accent">
+                          +₹{(priceInfo.priceAfterSurge - priceInfo.basePrice).toFixed(2)}
+                        </span>
+                      </div>
+                    )}
+                    {priceInfo.excessKm > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">
+                          Excess KM ({priceInfo.excessKm} km)
+                        </span>
+                        <span className="font-medium">+₹{priceInfo.excessKmCharge.toFixed(2)}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Subtotal</span>
+                      <span className="font-medium">₹{priceInfo.subtotal.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">
+                        GST ({priceInfo.gstPercentage}%)
+                      </span>
+                      <span className="font-medium">+₹{priceInfo.gstAmount.toFixed(2)}</span>
+                    </div>
+                  </div>
+                </>
+              )}
+              <hr />
+              <div className="flex justify-between text-lg font-bold">
+                <span>Total Amount</span>
+                <span>
+                  ₹{priceInfo ? priceInfo.total.toFixed(2) : (totalAmount || 0).toFixed(2)}
+                </span>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Button className="w-full" size="lg" onClick={handlePayment} disabled={loading}>
+                {loading
+                  ? 'Processing...'
+                  : `Pay ₹${(priceInfo ? priceInfo.total : totalAmount || 0).toFixed(2)}`}
+              </Button>
+            </CardFooter>
+          </Card>
+        </div>
+      </div>
+      <Footer />
+    </div>
+  );
+}

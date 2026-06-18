@@ -1,0 +1,13 @@
+node_modules/
+.env
+data/*.json
+!data/.gitkeep
+.env.example
+*.log
+uploads/
+.DS_Store
+
+
+
+
+

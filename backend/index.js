@@ -1,0 +1,243 @@
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
+
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import winston from 'winston';
+import morgan from 'morgan';
+import compression from 'compression';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import connectDB from './config/database.js';
+import authRoutes from './routes/auth.js';
+import bikeRoutes from './routes/bikes.js';
+import rentalRoutes from './routes/rentals.js';
+import userRoutes from './routes/users.js';
+import documentRoutes from './routes/documents.js';
+import locationRoutes from './routes/locations.js';
+import paymentRoutes from './routes/payments.js';
+import settingsRoutes from './routes/settings.js';
+import heroImageRoutes from './routes/heroImages.js';
+import supportRoutes from './routes/support.js';
+import { initCronJobs } from './utils/cron.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+// =====================================
+// ✅ LOGGER (Winston)
+// =====================================
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' }),
+  ],
+});
+
+if (process.env.NODE_ENV !== 'production') {
+  logger.add(new winston.transports.Console({
+    format: winston.format.combine(
+      winston.format.colorize(),
+      winston.format.simple()
+    ),
+  }));
+}
+
+// =====================================
+// ✅ PERFORMANCE & UTILITY MIDDLEWARE
+// =====================================
+app.set('trust proxy', true);
+app.use(compression()); // Compress all responses
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev')); // HTTP request logger
+
+// =====================================
+// ✅ IMPORTANT FOR RENDER / DEPLOYMENT
+// =====================================
+const PORT = process.env.PORT || 9000;
+
+// =====================================
+// ✅ SECURITY MIDDLEWARE
+// =====================================
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: false, // Disable if you're serving a frontend separately or use proper config
+}));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 200, // increased for production
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests from this IP, please try again after 15 minutes',
+});
+// app.use('/api/', limiter); // Apply only to API routes
+
+// =====================================
+// ✅ CORS CONFIGURATION
+// =====================================
+// =====================================
+// ✅ CORS CONFIGURATION (FIXED)
+// =====================================
+
+const allowedOrigins = [
+  "http://localhost:8080",
+  "http://127.0.0.1:8080",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://bikes-ay5i.vercel.app",
+  "https://bikes-green.vercel.app",
+  "https://bike.speshway.site",
+  process.env.PUBLIC_BASE_URL,
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
+// Also add any additional origins from ALLOWED_ORIGINS env var (comma-separated)
+if (process.env.ALLOWED_ORIGINS) {
+  const additionalOrigins = process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim());
+  allowedOrigins.push(...additionalOrigins);
+}
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like Postman, mobile apps)
+    if (!origin) return callback(null, true);
+
+    // Allow all origins in development
+    if (process.env.NODE_ENV !== 'production') {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      console.error("❌ CORS Blocked:", origin);
+      console.error("   Allowed origins:", allowedOrigins);
+      return callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+// ✅ VERY IMPORTANT (Fix preflight issue)
+app.options("*", cors());
+// =====================================
+// ✅ MIDDLEWARE
+// =====================================
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ====================================
+// app.use('/uploads', express.static(uploadsBaseDir));
+// app.use('/uploads', express.static('uploads'));
+
+// =====================================
+// ✅ ROUTES
+// =====================================
+app.use('/api/auth', authRoutes);
+app.use('/api/bikes', bikeRoutes);
+app.use('/api/rentals', rentalRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/locations', locationRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/hero-images', heroImageRoutes);
+app.use('/api/support', supportRoutes);
+
+// =====================================
+// ✅ HEALTH CHECK
+// =====================================
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV 
+  });
+});
+
+// =====================================
+// ✅ ROOT ROUTE
+// =====================================
+app.get('/', (req, res) => {
+  res.send('Bike Rental API is running. Documentation: /api/docs');
+});
+
+// =====================================
+// ✅ SERVE FRONTEND STATIC FILES (IN PRODUCTION)
+// =====================================
+const FRONTEND_BUILD_PATH = path.join(__dirname, '../frontend/dist');
+app.use(express.static(FRONTEND_BUILD_PATH));
+
+// =====================================
+// ✅ SPA FALLBACK ROUTE (SEND INDEX.HTML)
+// =====================================
+app.get('*', (req, res) => {
+  // If it's an API route, return 404 instead of index.html
+  if (req.originalUrl.startsWith('/api')) {
+    return res.status(404).json({ message: `API Route ${req.originalUrl} not found` });
+  }
+  // Otherwise, serve the frontend index.html for SPA routing
+  res.sendFile(path.join(FRONTEND_BUILD_PATH, 'index.html'));
+});
+
+// =====================================
+// ✅ GLOBAL ERROR HANDLER
+// =====================================
+app.use((err, req, res, next) => {
+  const statusCode = err.statusCode || 500;
+  logger.error(`${err.name}: ${err.message}`, { 
+    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+    path: req.originalUrl,
+    method: req.method
+  });
+  
+  res.status(statusCode).json({
+    status: 'error',
+    message: process.env.NODE_ENV === 'production' && statusCode === 500
+      ? 'Internal Server Error'
+      : err.message
+  });
+});
+// =====================================
+// ✅ START SERVER (FIXED)
+// =====================================
+const startServer = async () => {
+  try {
+    await connectDB(); // ✅ ONLY here
+
+    initCronJobs(); // ✅ after DB
+
+    const server = app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      logger.info(`🚀 Server running on port ${PORT}`);
+    });
+
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${PORT} is already in use. Please stop the process using this port and try again.`);
+        logger.error(`❌ Port ${PORT} is already in use`);
+      } else {
+        console.error('❌ Server error:', error.message);
+        logger.error('❌ Server error:', error.message);
+      }
+      process.exit(1);
+    });
+
+  } catch (error) {
+    logger.error("❌ Failed to start server:", error.message);
+    process.exit(1);
+  }
+};
+
+startServer();
