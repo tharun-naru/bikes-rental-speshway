@@ -94,6 +94,7 @@ const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://18.60.178.93",
+  "http://98.84.56.12"
   "https://bikes-ay5i.vercel.app",
   "https://bikes-green.vercel.app",
   "https://bike.speshway.site",
